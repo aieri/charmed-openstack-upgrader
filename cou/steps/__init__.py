@@ -26,6 +26,7 @@ from typing import Any, Coroutine, Iterable, List, Optional
 from cou.exceptions import CanceledStep
 
 logger = logging.getLogger(__name__)
+DEPENDENCY_DESCRIPTION_PREFIX = "├── "
 
 
 def compare_step_coroutines(coro1: Optional[Coroutine], coro2: Optional[Coroutine]) -> bool:
@@ -42,11 +43,14 @@ def compare_step_coroutines(coro1: Optional[Coroutine], coro2: Optional[Coroutin
         # compare two None or one None and one Coroutine
         return coro1 == coro2
 
+    inspection_coro1 = inspect.getcoroutinelocals(coro1)
+    inspection_coro2 = inspect.getcoroutinelocals(coro2)
+
     return (
         # check if same coroutine was used
         coro1.cr_code == coro2.cr_code
         # check coroutine arguments
-        and inspect.getcoroutinelocals(coro1) == inspect.getcoroutinelocals(coro2)
+        and inspection_coro1 == inspection_coro2
     )
 
 
@@ -71,6 +75,7 @@ class BaseStep:
         description: str = "",
         parallel: bool = False,
         coro: Optional[Coroutine] = None,
+        dependent: bool = False,
     ):
         """Initialize BaseStep.
 
@@ -80,6 +85,8 @@ class BaseStep:
         :type parallel: bool
         :param coro: Step coroutine
         :type coro: Optional[coroutine]
+        :param dependent: Whether the step is dependent from other step.
+        :type dependent: bool, defaults to False
         """
         if coro is not None:
             # NOTE(rgildein): We need to ignore coroutine not to be awaited if step is not run
@@ -89,7 +96,10 @@ class BaseStep:
 
         self._coro: Optional[Coroutine] = coro
         self.parallel = parallel
-        self.description = description
+        self.dependent = dependent
+        self.description = (
+            DEPENDENCY_DESCRIPTION_PREFIX + description if dependent else description
+        )
         self._sub_steps: List[BaseStep] = []
         self._canceled: bool = False
         self._task: Optional[asyncio.Task] = None
@@ -231,6 +241,15 @@ class BaseStep:
 
         self._sub_steps.append(step)
 
+    def add_steps(self, steps: Iterable[BaseStep]) -> None:
+        """Add multiple steps.
+
+        :param steps: Sequence of BaseStep to be added as sub steps.
+        :type steps: Iterable[BaseStep]
+        """
+        for step in steps:
+            self.add_step(step)
+
     def cancel(self, safe: bool = True) -> None:
         """Cancel step and all its sub steps.
 
@@ -298,6 +317,16 @@ class UpgradePlan(BaseStep):
         logger.debug("No coroutine to run for %s", repr(self))
 
 
+class HypervisorGroupUpgradePlan(UpgradePlan):
+    """Represents the plan for group of hypervisors.
+
+    This class is intended to be used as group for hypervisor upgrade steps, therefore
+    doesn't accept coroutine or parallel as inputs.
+    """
+
+    prompt: bool = True
+
+
 class ApplicationUpgradePlan(UpgradePlan):
     """Represents the plan for application-level upgrade.
 
@@ -306,6 +335,26 @@ class ApplicationUpgradePlan(UpgradePlan):
     """
 
     prompt: bool = True
+
+
+class HypervisorUpgradePlan(BaseStep):
+    """Represents the plan for hypervisor upgrade.
+
+    This class is intended to be used as a group for unit-level upgrade steps, which are
+    grouped by a single hypervisor. It doesn't accept coroutine or parallel as inputs.
+
+    All sub-steps will run in parallel.
+    """
+
+    prompt: bool = False
+
+    def __init__(self, description: str):
+        """Initialize upgrade plan.
+
+        :param description: Description of the step.
+        :type description: str
+        """
+        super().__init__(description=description, parallel=True, coro=None)
 
 
 class UpgradeStep(BaseStep):
@@ -324,3 +373,14 @@ class PreUpgradeStep(UpgradeStep):
 
 class PostUpgradeStep(UpgradeStep):
     """Represents the post-upgrade step."""
+
+
+def is_unit_upgrade_step(step: BaseStep) -> bool:
+    """Check if it's unit upgrade step.
+
+    :param step: step
+    :type step: BaseStep
+    :return: True if it's UnitUpgradeStep
+    :rtype: bool
+    """
+    return isinstance(step, UnitUpgradeStep)

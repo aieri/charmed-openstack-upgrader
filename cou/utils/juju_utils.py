@@ -13,9 +13,13 @@
 # limitations under the License.
 
 """Juju utilities for charmed-openstack-upgrader."""
+
+from __future__ import annotations
+
 import asyncio
 import logging
 import os
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Optional
 
@@ -129,6 +133,62 @@ def retry(
     return _wrapper
 
 
+@dataclass(frozen=True)
+class COUMachine:
+    """Representation of a juju machine."""
+
+    machine_id: str
+    apps: tuple[str]
+    az: Optional[str] = None  # simple deployments may not have azs
+
+
+@dataclass(frozen=True)
+class COUUnit:
+    """Representation of a single unit of application."""
+
+    name: str
+    machine: COUMachine
+    workload_version: str
+
+
+@dataclass(frozen=True)
+class COUApplication:
+    """Representation of a single application."""
+
+    # pylint: disable=too-many-instance-attributes
+
+    name: str
+    can_upgrade_to: str
+    charm: str
+    channel: str
+    config: dict[str, Any]
+    machines: dict[str, COUMachine]
+    model: COUModel
+    origin: str
+    series: str
+    subordinate_to: list[str]
+    units: dict[str, COUUnit]
+    workload_version: str
+
+    @property
+    def is_subordinate(self) -> bool:
+        """Check if application is subordinate.
+
+        :return: True if subordinate, False otherwise.
+        :rtype: bool
+        """
+        return bool(self.subordinate_to)
+
+    @property
+    def is_from_charm_store(self) -> bool:
+        """Check if application comes from charm store.
+
+        :return: True if comes, False otherwise.
+        :rtype: bool
+        """
+        return self.origin == "cs"
+
+
 class COUModel:
     """COU model object.
 
@@ -141,6 +201,22 @@ class COUModel:
         self._juju_data = FileJujuData()
         self._model = Model(max_frame_size=JUJU_MAX_FRAME_SIZE, jujudata=self.juju_data)
         self._name = name
+        self._applications: dict[str, COUApplication] | None = None
+
+    @property
+    def applications(self) -> dict[str, COUApplication]:
+        """Return cached applications.
+
+        This property represents the cached output of the get_applications function.
+
+        :return: dictionary of COUApplication
+        :rtype: dict[str, COUApplication]
+        :raises ValueError: When get_applications has not yet been called.
+        """
+        if self._applications is None:
+            raise ValueError("The get_applications has not yet been called.")
+
+        return self._applications
 
     @property
     def connected(self) -> bool:
@@ -168,27 +244,27 @@ class COUModel:
         return self._name
 
     @retry(no_retry_exceptions=(ActionFailed,))
-    async def _get_action_result(self, action: Action, raise_on_failure: bool) -> Action:
-        """Get results from action.
+    async def _get_waited_action_object(self, action: Action, raise_on_failure: bool) -> Action:
+        """Get waited action object.
+
+        To access action data from the returned action object, use `action_obj.data`, which
+        contains action parameters, results, status, and metadata. Alternatively, it is possible
+        to access action results directly with `action_obj.results`.
 
         :param action: Action object
         :type: Action
         :param raise_on_failure: Whether to raise ActionFailed exception on failure, defaults
                                  to False
         :type raise_on_failure: bool
-        :return: action results
+        :return: the awaited action object
         :rtype: Action
         :raises ActionFailed: When the application status is in error (it's not 'completed').
         """
-        result = await action.wait()
-        if raise_on_failure:
-            model = await self._get_model()
-            status = await model.get_action_status(uuid_or_prefix=action.entity_id)
-            if status != "completed":
-                output = await model.get_action_output(action.entity_id)
-                raise ActionFailed(action, output=output)
+        action_obj = await action.wait()
+        if raise_on_failure and action_obj.status != "completed":
+            raise ActionFailed(action, output=action_obj.data)
 
-        return result
+        return action_obj
 
     async def _get_application(self, name: str) -> Application:
         """Get juju.application.Application from model.
@@ -205,6 +281,27 @@ class COUModel:
             raise ApplicationNotFound(f"Application {name} was not found in model {model.name}.")
 
         return app
+
+    async def _get_machines(self) -> dict[str, COUMachine]:
+        """Get all the machines in the model.
+
+        :return: Dictionary of the machines found in the model. E.g: {'0': Machine0}
+        :rtype: dict[str, Machine]
+        """
+        model = await self._get_model()
+
+        return {
+            machine.id: COUMachine(
+                machine_id=machine.id,
+                apps=tuple(
+                    unit.application
+                    for unit in self._model.units.values()
+                    if unit.machine.id == machine.id
+                ),
+                az=machine.hardware_characteristics.get("availability-zone"),
+            )
+            for machine in model.machines.values()
+        }
 
     async def _get_model(self) -> Model:
         """Get juju.model.Model and make sure that it is connected.
@@ -255,6 +352,42 @@ class COUModel:
         )
 
     @retry
+    async def get_applications(self) -> dict[str, COUApplication]:
+        """Return list of applications with all relevant information.
+
+        :returns: list of application with all information
+        :rtype: list[COUApplication]
+        """
+        model = await self._get_model()
+        # note(rgildein): We get the applications from the Juju status, since we can get more
+        #                 information the status than from objects. e.g. workload_version for unit
+        full_status = await self.get_status()
+        machines = await self._get_machines()
+
+        self._applications = {
+            app: COUApplication(
+                name=app,
+                can_upgrade_to=status.can_upgrade_to,
+                charm=model.applications[app].charm_name,
+                channel=status.charm_channel,
+                config=await model.applications[app].get_config(),
+                machines={unit.machine: machines[unit.machine] for unit in status.units.values()},
+                model=self,
+                origin=status.charm.split(":")[0],
+                series=status.series,
+                subordinate_to=status.subordinate_to,
+                units={
+                    name: COUUnit(name, machines[unit.machine], unit.workload_version)
+                    for name, unit in status.units.items()
+                },
+                workload_version=status.workload_version,
+            )
+            for app, status in full_status.applications.items()
+        }
+
+        return self._applications
+
+    @retry(no_retry_exceptions=(ApplicationNotFound,))
     async def get_application_config(self, name: str) -> dict:
         """Return application configuration.
 
@@ -319,8 +452,8 @@ class COUModel:
         action_params = action_params or {}
         unit = await self._get_unit(unit_name)
         action = await unit.run_action(action_name, **action_params)
-        result = await self._get_action_result(action, raise_on_failure)
-        return result
+        action_obj = await self._get_waited_action_object(action, raise_on_failure)
+        return action_obj
 
     # NOTE (rgildein): There is no need to add retry here, because we don't want to repeat
     # `unit.run(...)` and the rest of the function is static.
@@ -349,6 +482,7 @@ class COUModel:
 
         if str(normalize_results["Code"]) != "0":
             raise CommandRunFailed(cmd=command, result=normalize_results)
+
         logger.debug(normalize_results["Stdout"])
 
         return normalize_results

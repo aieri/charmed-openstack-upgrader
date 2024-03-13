@@ -13,24 +13,22 @@
 # limitations under the License.
 
 """Entrypoint for 'charmed-openstack-upgrader'."""
-import argparse
 import asyncio
 import logging
 import logging.handlers
 import sys
 from enum import Enum
 from signal import SIGINT, SIGTERM
-from typing import Optional
 
 from juju.errors import JujuError
 
-from cou.commands import parse_args
+from cou.commands import CLIargs, parse_args
 from cou.exceptions import COUException, HighestReleaseAchieved, TimeoutException
 from cou.logging import setup_logging
 from cou.steps import UpgradePlan
 from cou.steps.analyze import Analysis
 from cou.steps.execute import apply_step
-from cou.steps.plan import generate_plan, manually_upgrade_data_plane
+from cou.steps.plan import generate_plan
 from cou.utils import print_and_debug, progress_indicator, prompt_input
 from cou.utils.cli import interrupt_handler
 from cou.utils.juju_utils import COUModel
@@ -107,19 +105,15 @@ async def continue_upgrade() -> bool:
     return False
 
 
-async def analyze_and_plan(
-    model_name: Optional[str], backup_database: bool
-) -> tuple[Analysis, UpgradePlan]:
+async def analyze_and_plan(args: CLIargs) -> UpgradePlan:
     """Analyze cloud and generate the upgrade plan with steps.
 
-    :param model_name: Model name inputted by user.
-    :type model_name: Optional[str]
-    :param backup_database: Whether to create database backup before upgrade.
-    :type backup_database: bool
-    :return: Generated analysis and upgrade plan.
-    :rtype: tuple[Analysis, UpgradePlan]
+    :param args: CLI arguments
+    :type args: CLIargs
+    :return: Generated upgrade plan.
+    :rtype: UpgradePlan
     """
-    model = COUModel(model_name)
+    model = COUModel(args.model_name)
     progress_indicator.start(f"Connecting to '{model.name}' model...")
     await model.connect()
     logger.info("Using model: %s", model.name)
@@ -131,50 +125,36 @@ async def analyze_and_plan(
     progress_indicator.succeed()
 
     progress_indicator.start("Generating upgrade plan...")
-    upgrade_plan = await generate_plan(analysis_result, backup_database)
+    upgrade_plan = await generate_plan(analysis_result, args)
     progress_indicator.succeed()
 
-    return analysis_result, upgrade_plan
+    return upgrade_plan
 
 
-async def get_upgrade_plan(model_name: Optional[str], backup_database: bool) -> None:
+async def get_upgrade_plan(args: CLIargs) -> None:
     """Get upgrade plan and print to console.
 
-    :param model_name: Model name inputted by user.
-    :type model_name: Optional[str]
-    :param backup_database: Whether to create database backup before upgrade.
-    :type backup_database: bool
+    :param args: CLI arguments
+    :type args: CLIargs
     """
-    analysis_result, upgrade_plan = await analyze_and_plan(model_name, backup_database)
+    upgrade_plan = await analyze_and_plan(args)
     print_and_debug(upgrade_plan)
-    manually_upgrade_data_plane(analysis_result)
     print(
         "Please note that the actual upgrade steps could be different if the cloud state "
         "changes because the plan will be re-calculated at upgrade time."
     )
 
 
-async def run_upgrade(
-    model_name: Optional[str],
-    backup_database: bool,
-    prompt: bool,
-    quiet: bool,
-) -> None:
+async def run_upgrade(args: CLIargs) -> None:
     """Run cloud upgrade.
 
-    :param model_name: Model name inputted by user.
-    :type model_name: Optional[str]
-    :param backup_database: Whether to create database backup before upgrade.
-    :type backup_database: bool
-    :param prompt: Whether to prompt to run upgrade interactively.
-    :type prompt: bool
-    :param quiet: Whether to run upgrade in quiet mode.
-    :type quiet: bool
+    :param args: CLI arguments
+    :type args: CLIargs
     """
-    analysis_result, upgrade_plan = await analyze_and_plan(model_name, backup_database)
+    upgrade_plan = await analyze_and_plan(args)
     print_and_debug(upgrade_plan)
 
-    if prompt and not await continue_upgrade():
+    if args.prompt and not await continue_upgrade():
         return
 
     # NOTE(rgildein): add handling upgrade plan canceling for SIGINT (ctrl+c) and SIGTERM
@@ -183,26 +163,24 @@ async def run_upgrade(
     loop.add_signal_handler(SIGTERM, interrupt_handler, upgrade_plan, loop, 143)
 
     # don't print plan if in quiet mode
-    if not quiet:
+    if not args.quiet:
         print("Running cloud upgrade...")
 
-    await apply_step(upgrade_plan, prompt)
-    manually_upgrade_data_plane(analysis_result)
+    await apply_step(upgrade_plan, args.prompt)
     print("Upgrade completed.")
 
 
-async def _run_command(args: argparse.Namespace) -> None:
+async def _run_command(args: CLIargs) -> None:
     """Run 'charmed-openstack-upgrade' command.
 
     :param args: CLI arguments
-    :type args: argparse.Namespace
+    :type args: CLIargs
     """
     match args.command:
         case "plan":
-            await get_upgrade_plan(args.model_name, args.backup)
+            await get_upgrade_plan(args)
         case "upgrade":
-            prompt = not args.auto_approve
-            await run_upgrade(args.model_name, args.backup, prompt, args.quiet)
+            await run_upgrade(args)
 
 
 def entrypoint() -> None:

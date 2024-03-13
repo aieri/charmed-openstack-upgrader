@@ -56,6 +56,10 @@ class NoTargetError(COUException):
 
 
 class HaltUpgradePlanGeneration(COUException):
+    """Exception to halt the application plan generation at any moment."""
+
+
+class HaltUpgradeExecution(COUException):
     """Exception to halt the application upgrade at any moment."""
 
 
@@ -65,6 +69,10 @@ class ApplicationError(COUException):
 
 class RunUpgradeError(COUException):
     """Exception raised when an upgrade fails."""
+
+
+class DataPlaneMachineFilterError(COUException):
+    """Exception raised when filtering data-plane machines fails."""
 
 
 class ActionFailed(COUException):
@@ -120,6 +128,10 @@ class OutOfSupportRange(COUException):
 
 class WaitForApplicationsTimeout(COUException):
     """Waiting for applications hit timeout error."""
+
+
+class DataPlaneCannotUpgrade(COUException):
+    """COU exception when the cloud is inconsistent to generate a plan."""
 
 
 class InterruptError(KeyboardInterrupt):

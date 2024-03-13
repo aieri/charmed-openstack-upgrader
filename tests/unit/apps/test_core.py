@@ -11,16 +11,14 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from juju.client._definitions import ApplicationStatus, UnitStatus
 
-from cou.apps.core import Keystone
-from cou.exceptions import (
-    ApplicationError,
-    HaltUpgradePlanGeneration,
-    MismatchedOpenStackVersions,
-)
+from cou.apps.base import OpenStackApplication
+from cou.apps.core import Keystone, NovaCompute
+from cou.exceptions import ApplicationError, HaltUpgradePlanGeneration
 from cou.steps import (
     ApplicationUpgradePlan,
     PostUpgradeStep,
@@ -29,306 +27,288 @@ from cou.steps import (
     UpgradeStep,
 )
 from cou.utils import app_utils
+from cou.utils import nova_compute as nova_compute_utils
+from cou.utils.juju_utils import COUMachine, COUUnit
 from cou.utils.openstack import OpenStackRelease
 from tests.unit.apps.utils import add_steps
+from tests.unit.utils import assert_steps, dedent_plan, generate_cou_machine
 
 
-def test_application_eq(status, config, model):
-    """Name of the app is used as comparison between Applications objects."""
-    status_keystone_1 = status["keystone_ussuri"]
-    config_keystone_1 = config["openstack_ussuri"]
-    status_keystone_2 = status["keystone_wallaby"]
-    config_keystone_2 = config["openstack_wallaby"]
-    keystone_1 = Keystone("keystone", status_keystone_1, config_keystone_1, model, "keystone")
-    keystone_2 = Keystone("keystone", status_keystone_2, config_keystone_2, model, "keystone")
-    keystone_3 = Keystone("keystone_foo", status_keystone_1, config_keystone_1, model, "keystone")
-
-    # keystone_1 is equal to keystone_2 because they have the same name
-    # even if they have different status and config.
-    assert keystone_1 == keystone_2
-    # keystone_1 is different then keystone_3 even if they have same status and config.
-    assert keystone_1 != keystone_3
-
-
-def assert_application(
-    app,
-    exp_name,
-    exp_series,
-    exp_status,
-    exp_config,
-    exp_model,
-    exp_charm,
-    exp_is_from_charm_store,
-    exp_os_origin,
-    exp_units,
-    exp_channel,
-    exp_current_os_release,
-    exp_possible_current_channels,
-    exp_target_channel,
-    exp_new_origin,
-    exp_apt_source_codename,
-    exp_channel_codename,
-    exp_is_subordinate,
-    exp_is_valid_track,
-    target,
-):
-    assert app.name == exp_name
-    assert app.series == exp_series
-    assert app.status == exp_status
-    assert app.config == exp_config
-    assert app.model == exp_model
-    assert app.charm == exp_charm
-    assert app.is_from_charm_store == exp_is_from_charm_store
-    assert app.os_origin == exp_os_origin
-    assert app.units == exp_units
-    assert app.channel == exp_channel
-    assert app.current_os_release == exp_current_os_release
-    assert app.possible_current_channels == exp_possible_current_channels
-    assert app.target_channel(target) == exp_target_channel
-    assert app.new_origin(target) == exp_new_origin
-    assert app.apt_source_codename == exp_apt_source_codename
-    assert app.channel_codename == exp_channel_codename
-    assert app.is_subordinate == exp_is_subordinate
-    assert app.is_valid_track(app.channel) == exp_is_valid_track
-
-
-def test_application_ussuri(status, config, units, model):
-    target = OpenStackRelease("victoria")
-    app_status = status["keystone_ussuri"]
-    app_config = config["openstack_ussuri"]
-    exp_is_from_charm_store = False
-    exp_os_origin = "distro"
-    exp_units = units["units_ussuri"]
-    exp_channel = app_status.charm_channel
-    exp_series = app_status.series
-    exp_current_os_release = "ussuri"
-    exp_possible_current_channels = ["ussuri/stable"]
-    exp_target_channel = f"{target}/stable"
-    exp_new_origin = f"cloud:{exp_series}-{target}"
-    exp_apt_source_codename = exp_current_os_release
-    exp_channel_codename = exp_current_os_release
-    exp_is_subordinate = False
-    exp_is_valid_track = True
-
-    app = Keystone("my_keystone", app_status, app_config, model, "keystone")
-    assert app.wait_for_model is True
-    assert_application(
-        app,
-        "my_keystone",
-        exp_series,
-        app_status,
-        app_config,
-        model,
-        "keystone",
-        exp_is_from_charm_store,
-        exp_os_origin,
-        exp_units,
-        exp_channel,
-        exp_current_os_release,
-        exp_possible_current_channels,
-        exp_target_channel,
-        exp_new_origin,
-        exp_apt_source_codename,
-        exp_channel_codename,
-        exp_is_subordinate,
-        exp_is_valid_track,
-        target,
-    )
-
-
-def test_application_different_wl(status, config, model):
-    """Different OpenStack Version on units if workload version is different."""
-    exp_error_msg = (
-        "Units of application my_keystone are running mismatched OpenStack versions: "
-        r"'ussuri': \['keystone\/0', 'keystone\/1'\], 'victoria': \['keystone\/2'\]. "
-        "This is not currently handled."
-    )
-    app_status = status["keystone_ussuri_victoria"]
-    app_config = config["openstack_ussuri"]
-
-    app = Keystone("my_keystone", app_status, app_config, model, "keystone")
-    with pytest.raises(MismatchedOpenStackVersions, match=exp_error_msg):
-        app.current_os_release
-
-
-def test_application_cs(status, config, units, model):
-    """Test when application is from charm store."""
-    target = OpenStackRelease("victoria")
-    app_status = status["keystone_ussuri_cs"]
-    app_config = config["openstack_ussuri"]
-    exp_os_origin = "distro"
-    exp_units = units["units_ussuri"]
-    exp_channel = app_status.charm_channel
-    exp_is_from_charm_store = True
-    exp_series = app_status.series
-    exp_current_os_release = "ussuri"
-    exp_possible_current_channels = ["ussuri/stable"]
-    exp_target_channel = f"{target}/stable"
-    exp_new_origin = f"cloud:{exp_series}-{target}"
-    exp_apt_source_codename = exp_current_os_release
-    exp_channel_codename = exp_current_os_release
-    exp_is_subordinate = False
-    exp_is_valid_track = True
-
-    app = Keystone("my_keystone", app_status, app_config, model, "keystone")
-    assert_application(
-        app,
-        "my_keystone",
-        exp_series,
-        app_status,
-        app_config,
-        model,
-        "keystone",
-        exp_is_from_charm_store,
-        exp_os_origin,
-        exp_units,
-        exp_channel,
-        exp_current_os_release,
-        exp_possible_current_channels,
-        exp_target_channel,
-        exp_new_origin,
-        exp_apt_source_codename,
-        exp_channel_codename,
-        exp_is_subordinate,
-        exp_is_valid_track,
-        target,
-    )
-
-
-def test_application_wallaby(status, config, units, model):
-    target = OpenStackRelease("xena")
-    exp_units = units["units_wallaby"]
-    exp_is_from_charm_store = False
-    app_config = config["openstack_wallaby"]
-    app_status = status["keystone_wallaby"]
-    exp_os_origin = "cloud:focal-wallaby"
-    exp_channel = app_status.charm_channel
-    exp_series = app_status.series
-    exp_current_os_release = "wallaby"
-    exp_possible_current_channels = ["wallaby/stable"]
-    exp_target_channel = f"{target}/stable"
-    exp_new_origin = f"cloud:{exp_series}-{target}"
-    exp_apt_source_codename = exp_current_os_release
-    exp_channel_codename = exp_current_os_release
-    exp_is_subordinate = False
-    exp_is_valid_track = True
-
-    app = Keystone("my_keystone", app_status, app_config, model, "keystone")
-    assert_application(
-        app,
-        "my_keystone",
-        exp_series,
-        app_status,
-        app_config,
-        model,
-        "keystone",
-        exp_is_from_charm_store,
-        exp_os_origin,
-        exp_units,
-        exp_channel,
-        exp_current_os_release,
-        exp_possible_current_channels,
-        exp_target_channel,
-        exp_new_origin,
-        exp_apt_source_codename,
-        exp_channel_codename,
-        exp_is_subordinate,
-        exp_is_valid_track,
-        target,
-    )
-
-
-def test_application_no_origin_config(status, model):
+def test_application_different_wl(model):
+    """The OpenStack version is considered the lowest of the units."""
+    machines = {
+        "0": MagicMock(spec_set=COUMachine),
+        "1": MagicMock(spec_set=COUMachine),
+        "2": MagicMock(spec_set=COUMachine),
+    }
+    units = {
+        "keystone/0": COUUnit(
+            name="keystone/0",
+            workload_version="17.0.1",
+            machine=machines["0"],
+        ),
+        "keystone/1": COUUnit(
+            name="keystone/1",
+            workload_version="17.0.1",
+            machine=machines["1"],
+        ),
+        "keystone/2": COUUnit(
+            name="keystone/2",
+            workload_version="18.1.0",
+            machine=machines["2"],
+        ),
+    }
     app = Keystone(
-        "my_keystone",
-        status["keystone_ussuri"],
-        {},
-        model,
-        "keystone",
+        name="keystone",
+        can_upgrade_to="ussuri/stable",
+        charm="keystone",
+        channel="ussuri/stable",
+        config={"source": {"value": "distro"}},
+        machines=machines,
+        model=model,
+        origin="ch",
+        series="focal",
+        subordinate_to=[],
+        units=units,
+        workload_version="18.1.0",
     )
-    assert app._get_os_origin() == ""
+    assert OpenStackRelease("victoria") in app.os_release_units
+    assert app.current_os_release == OpenStackRelease("ussuri")
+
+
+def test_application_no_origin_config(model):
+    """Test Keystone application without origin."""
+    machines = {"0": MagicMock(spec_set=COUMachine)}
+    app = Keystone(
+        name="keystone",
+        can_upgrade_to="ussuri/stable",
+        charm="keystone",
+        channel="ussuri/stable",
+        config={},
+        machines=machines,
+        model=model,
+        origin="ch",
+        series="focal",
+        subordinate_to=[],
+        units={
+            "keystone/0": COUUnit(
+                name="keystone/0",
+                workload_version="18.0.1",
+                machine=machines["0"],
+            )
+        },
+        workload_version="18.1.0",
+    )
+
+    assert app.os_origin == ""
     assert app.apt_source_codename is None
 
 
-def test_application_empty_origin_config(status, model):
+def test_application_empty_origin_config(model):
+    """Test Keystone application with empty origin."""
+    machines = {"0": MagicMock(spec_set=COUMachine)}
     app = Keystone(
-        "my_keystone",
-        status["keystone_ussuri"],
-        {"source": {"value": ""}},
-        model,
-        "keystone",
+        name="keystone",
+        can_upgrade_to="ussuri/stable",
+        charm="keystone",
+        channel="ussuri/stable",
+        config={"source": {"value": ""}},
+        machines=machines,
+        model=model,
+        origin="ch",
+        series="focal",
+        subordinate_to=[],
+        units={
+            "keystone/0": COUUnit(
+                name="keystone/0",
+                workload_version="18.0.1",
+                machine=machines["0"],
+            )
+        },
+        workload_version="18.1.0",
     )
+
     assert app.apt_source_codename is None
 
 
-def test_application_unexpected_channel(status, config, model):
+def test_application_unexpected_channel(model):
+    """Test Keystone application with unexpected channel."""
     target = OpenStackRelease("xena")
-    app_status = status["keystone_wallaby"]
-    # channel is set to a previous OpenStack release
-    app_status.charm_channel = "ussuri/stable"
-    app = Keystone(
-        "my_keystone",
-        app_status,
-        config["openstack_wallaby"],
-        model,
-        "keystone",
+    exp_msg = (
+        "'keystone' has unexpected channel: 'ussuri/stable' for the current workload version "
+        "and OpenStack release: 'wallaby'. Possible channels are: wallaby/stable"
     )
-    with pytest.raises(ApplicationError):
-        app.generate_upgrade_plan(target)
+    machines = {"0": MagicMock(spec_set=COUMachine)}
+    app = Keystone(
+        name="keystone",
+        can_upgrade_to="ussuri/stable",
+        charm="keystone",
+        channel="ussuri/stable",
+        config={"source": {"value": ""}},
+        machines=machines,
+        model=model,
+        origin="ch",
+        series="focal",
+        subordinate_to=[],
+        units={
+            "keystone/0": COUUnit(
+                name="keystone/0",
+                workload_version="19.0.1",
+                machine=machines["0"],
+            )
+        },
+        workload_version="19.1.0",
+    )
+
+    with pytest.raises(ApplicationError, match=exp_msg):
+        app.generate_upgrade_plan(target, False)
 
 
 @pytest.mark.parametrize(
     "source_value",
     ["ppa:myteam/ppa", "cloud:xenial-proposed/ocata", "http://my.archive.com/ubuntu main"],
 )
-def test_application_unknown_source(status, model, source_value):
+def test_application_unknown_source(source_value, model):
+    """Test Keystone application with unknown source."""
+    machines = {"0": MagicMock(spec_set=COUMachine)}
+    exp_msg = f"'keystone' has an invalid 'source': {source_value}"
     app = Keystone(
-        "my_keystone",
-        status["keystone_ussuri"],
-        {"source": {"value": source_value}},
-        model,
-        "keystone",
+        name="keystone",
+        can_upgrade_to="ussuri/stable",
+        charm="keystone",
+        channel="ussuri/stable",
+        config={"source": {"value": source_value}},
+        machines=machines,
+        model=model,
+        origin="ch",
+        series="focal",
+        subordinate_to=[],
+        units={
+            "keystone/0": COUUnit(
+                name="keystone/0",
+                workload_version="19.0.1",
+                machine=machines["0"],
+            )
+        },
+        workload_version="19.1.0",
     )
-    with pytest.raises(ApplicationError):
+
+    with pytest.raises(ApplicationError, match=exp_msg):
         app.apt_source_codename
 
 
 @pytest.mark.asyncio
-async def test_application_check_upgrade(status, config, model):
+async def test_application_verify_workload_upgrade(model):
+    """Test Kyestone application check successful upgrade."""
     target = OpenStackRelease("victoria")
-    app_status = status["keystone_ussuri"]
-    app_config = config["openstack_ussuri"]
+    machines = {"0": MagicMock(spec_set=COUMachine)}
+    app = Keystone(
+        name="keystone",
+        can_upgrade_to="ussuri/stable",
+        charm="keystone",
+        channel="ussuri/stable",
+        config={
+            "openstack-origin": {"value": "distro"},
+            "action-managed-upgrade": {"value": True},
+        },
+        machines=machines,
+        model=model,
+        origin="ch",
+        series="focal",
+        subordinate_to=[],
+        units={
+            "keystone/0": COUUnit(
+                name="keystone/0",
+                workload_version="17.0.1",
+                machine=machines["0"],
+            )
+        },
+        workload_version="17.1.0",
+    )
 
     # workload version changed from ussuri to victoria
     mock_status = AsyncMock()
-    mock_status.return_value.applications = {"my_keystone": status["keystone_victoria"]}
+    mock_app_status = MagicMock(spec_set=ApplicationStatus())
+    mock_unit_status = MagicMock(spec_set=UnitStatus())
+    mock_unit_status.workload_version = "18.1.0"
+    mock_app_status.units = {"keystone/0": mock_unit_status}
+    mock_status.return_value.applications = {"keystone": mock_app_status}
     model.get_status = mock_status
-    app = Keystone("my_keystone", app_status, app_config, model, "keystone")
-    await app._check_upgrade(target)
+
+    assert await app._verify_workload_upgrade(target, app.units.values()) is None
 
 
 @pytest.mark.asyncio
-async def test_application_check_upgrade_fail(status, config, model):
-    exp_error_msg = "Cannot upgrade units 'keystone/0, keystone/1, keystone/2' to victoria."
+async def test_application_verify_workload_upgrade_fail(model):
+    """Test Kyestone application check unsuccessful upgrade."""
     target = OpenStackRelease("victoria")
-    app_status = status["keystone_ussuri"]
-    app_config = config["openstack_ussuri"]
+    exp_msg = "Cannot upgrade units 'keystone/0' to victoria."
+    machines = {"0": MagicMock(spec_set=COUMachine)}
+    app = Keystone(
+        name="keystone",
+        can_upgrade_to="ussuri/stable",
+        charm="keystone",
+        channel="ussuri/stable",
+        config={
+            "openstack-origin": {"value": "distro"},
+            "action-managed-upgrade": {"value": True},
+        },
+        machines=machines,
+        model=model,
+        origin="ch",
+        series="focal",
+        subordinate_to=[],
+        units={
+            "keystone/0": COUUnit(
+                name="keystone/0",
+                workload_version="17.0.1",
+                machine=machines["0"],
+            )
+        },
+        workload_version="17.1.0",
+    )
 
     # workload version didn't change from ussuri to victoria
     mock_status = AsyncMock()
-    mock_status.return_value.applications = {"my_keystone": app_status}
+    mock_app_status = MagicMock(spec_set=ApplicationStatus())
+    mock_unit_status = MagicMock(spec_set=UnitStatus())
+    mock_unit_status.workload_version = "17.1.0"
+    mock_app_status.units = {"keystone/0": mock_unit_status}
+    mock_status.return_value.applications = {"keystone": mock_app_status}
     model.get_status = mock_status
-    app = Keystone("my_keystone", app_status, app_config, model, "keystone")
-    with pytest.raises(ApplicationError, match=exp_error_msg):
-        await app._check_upgrade(target)
+
+    with pytest.raises(ApplicationError, match=exp_msg):
+        await app._verify_workload_upgrade(target, app.units.values())
 
 
-def test_upgrade_plan_ussuri_to_victoria(status, config, model):
+def test_upgrade_plan_ussuri_to_victoria(model):
+    """Test generate plan to upgrade Keystone from Ussuri to Victoria."""
     target = OpenStackRelease("victoria")
-    app_status = status["keystone_ussuri"]
-    app_config = config["openstack_ussuri"]
-    app = Keystone("my_keystone", app_status, app_config, model, "keystone")
-    upgrade_plan = app.generate_upgrade_plan(target)
+    machines = {"0": MagicMock(spec_set=COUMachine)}
+    app = Keystone(
+        name="keystone",
+        can_upgrade_to="ussuri/stable",
+        charm="keystone",
+        channel="ussuri/stable",
+        config={
+            "openstack-origin": {"value": "distro"},
+            "action-managed-upgrade": {"value": True},
+        },
+        machines=machines,
+        model=model,
+        origin="ch",
+        series="focal",
+        subordinate_to=[],
+        units={
+            f"keystone/{unit}": COUUnit(
+                name=f"keystone/{unit}",
+                workload_version="17.0.1",
+                machine=machines["0"],
+            )
+            for unit in range(3)
+        },
+        workload_version="17.1.0",
+    )
     expected_plan = ApplicationUpgradePlan(
         description=f"Upgrade plan for '{app.name}' to {target}"
     )
@@ -336,7 +316,7 @@ def test_upgrade_plan_ussuri_to_victoria(status, config, model):
         description=f"Upgrade software packages of '{app.name}' from the current APT repositories",
         parallel=True,
     )
-    for unit in app.units:
+    for unit in app.units.values():
         upgrade_packages.add_step(
             UnitUpgradeStep(
                 description=f"Upgrade software packages on unit {unit.name}",
@@ -352,7 +332,7 @@ def test_upgrade_plan_ussuri_to_victoria(status, config, model):
             coro=model.upgrade_charm(app.name, "ussuri/stable", switch=None),
         ),
         UpgradeStep(
-            description=f"Change charm config of '{app.name}' 'action-managed-upgrade' to False.",
+            description=f"Change charm config of '{app.name}' 'action-managed-upgrade' to False",
             parallel=False,
             coro=model.set_application_config(app.name, {"action-managed-upgrade": False}),
         ),
@@ -377,22 +357,48 @@ def test_upgrade_plan_ussuri_to_victoria(status, config, model):
             coro=model.wait_for_active_idle(1800, apps=None),
         ),
         PostUpgradeStep(
-            description=f"Check if the workload of '{app.name}' has been upgraded",
+            description=(
+                f"Check if the workload of '{app.name}' has been upgraded on units: "
+                f"{', '.join([unit for unit in app.units.keys()])}"
+            ),
             parallel=False,
-            coro=app._check_upgrade(target),
+            coro=app._verify_workload_upgrade(target, list(app.units.values())),
         ),
     ]
     add_steps(expected_plan, upgrade_steps)
 
-    assert upgrade_plan == expected_plan
+    upgrade_plan = app.generate_upgrade_plan(target, False)
+    assert_steps(upgrade_plan, expected_plan)
 
 
-def test_upgrade_plan_ussuri_to_victoria_ch_migration(status, config, model):
+def test_upgrade_plan_ussuri_to_victoria_ch_migration(model):
+    """Test generate plan to upgrade Keystone from Ussuri to Victoria with charmhub migration."""
     target = OpenStackRelease("victoria")
-    app_status = status["keystone_ussuri_cs"]
-    app_config = config["openstack_ussuri"]
-    app = Keystone("my_keystone", app_status, app_config, model, "keystone")
-    upgrade_plan = app.generate_upgrade_plan(target)
+    machines = {"0": MagicMock(spec_set=COUMachine)}
+    app = Keystone(
+        name="keystone",
+        can_upgrade_to="ussuri/stable",
+        charm="keystone",
+        channel="ussuri/stable",
+        config={
+            "openstack-origin": {"value": "distro"},
+            "action-managed-upgrade": {"value": True},
+        },
+        machines=machines,
+        model=model,
+        origin="cs",
+        series="focal",
+        subordinate_to=[],
+        units={
+            f"keystone/{unit}": COUUnit(
+                name=f"keystone/{unit}",
+                workload_version="17.0.1",
+                machine=machines["0"],
+            )
+            for unit in range(3)
+        },
+        workload_version="17.1.0",
+    )
     expected_plan = ApplicationUpgradePlan(
         description=f"Upgrade plan for '{app.name}' to {target}"
     )
@@ -400,7 +406,7 @@ def test_upgrade_plan_ussuri_to_victoria_ch_migration(status, config, model):
         description=f"Upgrade software packages of '{app.name}' from the current APT repositories",
         parallel=True,
     )
-    for unit in app.units:
+    for unit in app.units.values():
         upgrade_packages.add_step(
             UnitUpgradeStep(
                 description=f"Upgrade software packages on unit {unit.name}",
@@ -416,7 +422,7 @@ def test_upgrade_plan_ussuri_to_victoria_ch_migration(status, config, model):
             coro=model.upgrade_charm(app.name, "ussuri/stable", switch="ch:keystone"),
         ),
         UpgradeStep(
-            description=f"Change charm config of '{app.name}' 'action-managed-upgrade' to False.",
+            description=f"Change charm config of '{app.name}' 'action-managed-upgrade' to False",
             parallel=False,
             coro=model.set_application_config(app.name, {"action-managed-upgrade": False}),
         ),
@@ -441,25 +447,51 @@ def test_upgrade_plan_ussuri_to_victoria_ch_migration(status, config, model):
             coro=model.wait_for_active_idle(1800, apps=None),
         ),
         PostUpgradeStep(
-            description=f"Check if the workload of '{app.name}' has been upgraded",
+            description=(
+                f"Check if the workload of '{app.name}' has been upgraded on units: "
+                f"{', '.join([unit for unit in app.units.keys()])}"
+            ),
             parallel=False,
-            coro=app._check_upgrade(target),
+            coro=app._verify_workload_upgrade(target, list(app.units.values())),
         ),
     ]
     add_steps(expected_plan, upgrade_steps)
 
-    assert upgrade_plan == expected_plan
+    upgrade_plan = app.generate_upgrade_plan(target, False)
+    assert_steps(upgrade_plan, expected_plan)
 
 
-def test_upgrade_plan_channel_on_next_os_release(status, config, model):
+def test_upgrade_plan_channel_on_next_os_release(model):
+    """Test generate plan to upgrade Keystone from Ussuri to Victoria with updated channel.
+
+    The app channel it's already on next OpenStack release.
+    """
     target = OpenStackRelease("victoria")
-    app_status = status["keystone_ussuri"]
-    app_config = config["openstack_ussuri"]
-    # channel it's already on next OpenStack release
-    app_status.charm_channel = "victoria/stable"
-    app = Keystone("my_keystone", app_status, app_config, model, "keystone")
-    upgrade_plan = app.generate_upgrade_plan(target)
-
+    machines = {"0": MagicMock(spec_set=COUMachine)}
+    app = Keystone(
+        name="keystone",
+        can_upgrade_to="victoria/stable",
+        charm="keystone",
+        channel="victoria/stable",
+        config={
+            "openstack-origin": {"value": "distro"},
+            "action-managed-upgrade": {"value": True},
+        },
+        machines=machines,
+        model=model,
+        origin="ch",
+        series="focal",
+        subordinate_to=[],
+        units={
+            f"keystone/{unit}": COUUnit(
+                name=f"keystone/{unit}",
+                workload_version="17.0.1",
+                machine=machines["0"],
+            )
+            for unit in range(3)
+        },
+        workload_version="17.1.0",
+    )
     expected_plan = ApplicationUpgradePlan(
         description=f"Upgrade plan for '{app.name}' to {target}"
     )
@@ -468,7 +500,7 @@ def test_upgrade_plan_channel_on_next_os_release(status, config, model):
         description=f"Upgrade software packages of '{app.name}' from the current APT repositories",
         parallel=True,
     )
-    for unit in app.units:
+    for unit in app.units.values():
         upgrade_packages.add_step(
             UnitUpgradeStep(
                 description=f"Upgrade software packages on unit {unit.name}",
@@ -479,7 +511,7 @@ def test_upgrade_plan_channel_on_next_os_release(status, config, model):
     upgrade_steps = [
         upgrade_packages,
         UpgradeStep(
-            description=f"Change charm config of '{app.name}' 'action-managed-upgrade' to False.",
+            description=f"Change charm config of '{app.name}' 'action-managed-upgrade' to False",
             parallel=False,
             coro=model.set_application_config(app.name, {"action-managed-upgrade": False}),
         ),
@@ -499,24 +531,51 @@ def test_upgrade_plan_channel_on_next_os_release(status, config, model):
             coro=model.wait_for_active_idle(1800, apps=None),
         ),
         PostUpgradeStep(
-            description=f"Check if the workload of '{app.name}' has been upgraded",
+            description=(
+                f"Check if the workload of '{app.name}' has been upgraded on units: "
+                f"{', '.join([unit for unit in app.units.keys()])}"
+            ),
             parallel=False,
-            coro=app._check_upgrade(target),
+            coro=app._verify_workload_upgrade(target, list(app.units.values())),
         ),
     ]
     add_steps(expected_plan, upgrade_steps)
 
-    assert upgrade_plan == expected_plan
+    upgrade_plan = app.generate_upgrade_plan(target, False)
+    assert_steps(upgrade_plan, expected_plan)
 
 
-def test_upgrade_plan_origin_already_on_next_openstack_release(status, config, model):
+def test_upgrade_plan_origin_already_on_next_openstack_release(model):
+    """Test generate plan to upgrade Keystone from Ussuri to Victoria with origin changed.
+
+    The app config option openstack-origin it's already on next OpenStack release.
+    """
     target = OpenStackRelease("victoria")
-    app_status = status["keystone_ussuri"]
-    app_config = config["openstack_ussuri"]
-    # openstack-origin already configured for next OpenStack release
-    app_config["openstack-origin"]["value"] = "cloud:focal-victoria"
-    app = Keystone("my_keystone", app_status, app_config, model, "keystone")
-    upgrade_plan = app.generate_upgrade_plan(target)
+    machines = {"0": MagicMock(spec_set=COUMachine)}
+    app = Keystone(
+        name="keystone",
+        can_upgrade_to="ussuri/stable",
+        charm="keystone",
+        channel="ussuri/stable",
+        config={
+            "openstack-origin": {"value": "cloud:focal-victoria"},
+            "action-managed-upgrade": {"value": True},
+        },
+        machines=machines,
+        model=model,
+        origin="ch",
+        series="focal",
+        subordinate_to=[],
+        units={
+            f"keystone/{unit}": COUUnit(
+                name=f"keystone/{unit}",
+                workload_version="17.0.1",
+                machine=machines["0"],
+            )
+            for unit in range(3)
+        },
+        workload_version="17.1.0",
+    )
     expected_plan = ApplicationUpgradePlan(
         description=f"Upgrade plan for '{app.name}' to {target}"
     )
@@ -524,7 +583,7 @@ def test_upgrade_plan_origin_already_on_next_openstack_release(status, config, m
         description=f"Upgrade software packages of '{app.name}' from the current APT repositories",
         parallel=True,
     )
-    for unit in app.units:
+    for unit in app.units.values():
         upgrade_packages.add_step(
             UnitUpgradeStep(
                 description=f"Upgrade software packages on unit {unit.name}",
@@ -540,7 +599,7 @@ def test_upgrade_plan_origin_already_on_next_openstack_release(status, config, m
             coro=model.upgrade_charm(app.name, "ussuri/stable", switch=None),
         ),
         UpgradeStep(
-            description=f"Change charm config of '{app.name}' 'action-managed-upgrade' to False.",
+            description=f"Change charm config of '{app.name}' 'action-managed-upgrade' to False",
             parallel=False,
             coro=model.set_application_config(app.name, {"action-managed-upgrade": False}),
         ),
@@ -555,43 +614,86 @@ def test_upgrade_plan_origin_already_on_next_openstack_release(status, config, m
             coro=model.wait_for_active_idle(1800, apps=None),
         ),
         PostUpgradeStep(
-            description=f"Check if the workload of '{app.name}' has been upgraded",
+            description=(
+                f"Check if the workload of '{app.name}' has been upgraded on units: "
+                f"{', '.join([unit for unit in app.units.keys()])}"
+            ),
             parallel=False,
-            coro=app._check_upgrade(target),
+            coro=app._verify_workload_upgrade(target, list(app.units.values())),
         ),
     ]
     add_steps(expected_plan, upgrade_steps)
 
-    assert upgrade_plan == expected_plan
+    upgrade_plan = app.generate_upgrade_plan(target, False)
+    assert_steps(upgrade_plan, expected_plan)
 
 
-def test_upgrade_plan_application_already_upgraded(status, config, model):
+def test_upgrade_plan_application_already_upgraded(model):
+    """Test generate plan to upgrade Keystone from Victoria to Victoria."""
     exp_error_msg = (
-        "Application 'my_keystone' already configured for release equal or greater "
+        "Application 'keystone' already configured for release equal to or greater "
         "than victoria. Ignoring."
     )
     target = OpenStackRelease("victoria")
-    app_status = status["keystone_wallaby"]
-    app_config = config["openstack_wallaby"]
-    app = Keystone("my_keystone", app_status, app_config, model, "keystone")
+    machines = {"0": MagicMock(spec_set=COUMachine)}
+    app = Keystone(
+        name="keystone",
+        can_upgrade_to="",
+        charm="keystone",
+        channel="wallaby/stable",
+        config={
+            "openstack-origin": {"value": "cloud:focal-wallaby"},
+            "action-managed-upgrade": {"value": True},
+        },
+        machines=machines,
+        model=model,
+        origin="ch",
+        series="focal",
+        subordinate_to=[],
+        units={
+            f"keystone/{unit}": COUUnit(
+                name=f"keystone/{unit}",
+                workload_version="19.0.1",
+                machine=machines["0"],
+            )
+            for unit in range(3)
+        },
+        workload_version="19.1.0",
+    )
+
     # victoria is lesser than wallaby, so application should not generate a plan.
     with pytest.raises(HaltUpgradePlanGeneration, match=exp_error_msg):
-        app.generate_upgrade_plan(target)
+        app.generate_upgrade_plan(target, False)
 
 
-def test_upgrade_plan_application_already_disable_action_managed(status, config, model):
+def test_upgrade_plan_application_already_disable_action_managed(model):
+    """Test generate plan to upgrade Keystone with managed upgrade disabled."""
     target = OpenStackRelease("victoria")
-    app_status = status["keystone_ussuri"]
-    app_config = config["openstack_ussuri"]
-    app_config["action-managed-upgrade"]["value"] = False
+    machines = {"0": MagicMock(spec_set=COUMachine)}
     app = Keystone(
-        "my_keystone",
-        app_status,
-        app_config,
-        model,
-        "keystone",
+        name="keystone",
+        can_upgrade_to="ussuri/stable",
+        charm="keystone",
+        channel="ussuri/stable",
+        config={
+            "openstack-origin": {"value": "distro"},
+            "action-managed-upgrade": {"value": False},
+        },
+        machines=machines,
+        model=model,
+        origin="ch",
+        series="focal",
+        subordinate_to=[],
+        units={
+            f"keystone/{unit}": COUUnit(
+                name=f"keystone/{unit}",
+                workload_version="17.0.1",
+                machine=machines["0"],
+            )
+            for unit in range(3)
+        },
+        workload_version="17.1.0",
     )
-    upgrade_plan = app.generate_upgrade_plan(target)
     expected_plan = ApplicationUpgradePlan(
         description=f"Upgrade plan for '{app.name}' to {target}"
     )
@@ -599,7 +701,7 @@ def test_upgrade_plan_application_already_disable_action_managed(status, config,
         description=f"Upgrade software packages of '{app.name}' from the current APT repositories",
         parallel=True,
     )
-    for unit in app.units:
+    for unit in app.units.values():
         upgrade_packages.add_step(
             UnitUpgradeStep(
                 description=f"Upgrade software packages on unit {unit.name}",
@@ -635,11 +737,326 @@ def test_upgrade_plan_application_already_disable_action_managed(status, config,
             coro=model.wait_for_active_idle(1800, apps=None),
         ),
         PostUpgradeStep(
-            description=f"Check if the workload of '{app.name}' has been upgraded",
+            description=(
+                f"Check if the workload of '{app.name}' has been upgraded on units: "
+                f"{', '.join([unit for unit in app.units.keys()])}"
+            ),
             parallel=False,
-            coro=app._check_upgrade(target),
+            coro=app._verify_workload_upgrade(target, list(app.units.values())),
         ),
     ]
     add_steps(expected_plan, upgrade_steps)
 
-    assert upgrade_plan == expected_plan
+    upgrade_plan = app.generate_upgrade_plan(target, False)
+    assert_steps(upgrade_plan, expected_plan)
+
+
+@pytest.mark.parametrize("force", [True, False])
+# add_step check if the step added is from BaseStep, so the return is an empty UnitUpgradeStep
+@patch("cou.apps.core.NovaCompute._get_enable_scheduler_step", return_value=UnitUpgradeStep())
+@patch("cou.apps.core.NovaCompute._get_resume_unit_step", return_value=UnitUpgradeStep())
+@patch("cou.apps.core.NovaCompute._get_openstack_upgrade_step", return_value=UnitUpgradeStep())
+@patch("cou.apps.core.NovaCompute._get_pause_unit_step", return_value=UnitUpgradeStep())
+@patch("cou.apps.core.NovaCompute._get_empty_hypervisor_step", return_value=UnitUpgradeStep())
+@patch("cou.apps.core.NovaCompute._get_disable_scheduler_step", return_value=UnitUpgradeStep())
+def test_nova_compute_get_unit_upgrade_steps(
+    mock_disable,
+    mock_empty,
+    mock_pause,
+    mock_upgrade,
+    mock_resume,
+    mock_enable,
+    model,
+    force,
+):
+    app = _generate_nova_compute_app(model)
+    unit = app.units["nova-compute/0"]
+
+    app._get_unit_upgrade_steps(unit, force)
+
+    mock_disable.assert_called_once_with(unit)
+    if force:
+        mock_empty.assert_not_called()
+    else:
+        mock_empty.assert_called_once_with(unit)
+
+    mock_pause.assert_called_once_with(unit, not force)
+    mock_upgrade.assert_called_once_with(unit, not force)
+    mock_resume.assert_called_once_with(unit, not force)
+    mock_enable.assert_called_once_with(unit)
+
+
+def test_nova_compute_get_empty_hypervisor_step(model):
+    app = _generate_nova_compute_app(model)
+    units = list(app.units.values())
+    unit = units[0]
+
+    expected_step = UpgradeStep(
+        description=f"Check if unit {unit.name} has no VMs running before upgrading.",
+        coro=nova_compute_utils.verify_empty_hypervisor_before_upgrade(unit, model),
+    )
+    assert app._get_empty_hypervisor_step(unit) == expected_step
+
+
+def test_nova_compute_get_enable_scheduler_step(model):
+    app = _generate_nova_compute_app(model)
+    units = list(app.units.values())
+    unit = units[0]
+
+    expected_step = UpgradeStep(
+        description=f"Enable nova-compute scheduler from unit: '{unit.name}'.",
+        coro=model.run_action(unit_name=unit.name, action_name="enable", raise_on_failure=True),
+    )
+    assert app._get_enable_scheduler_step(unit) == expected_step
+
+
+def test_nova_compute_get_disable_scheduler_step(model):
+    app = _generate_nova_compute_app(model)
+    units = list(app.units.values())
+    unit = units[0]
+
+    expected_step = UpgradeStep(
+        description=f"Disable nova-compute scheduler from unit: '{unit.name}'.",
+        coro=model.run_action(unit_name=unit.name, action_name="disable", raise_on_failure=True),
+    )
+    assert app._get_disable_scheduler_step(unit) == expected_step
+
+
+def _generate_nova_compute_app(model):
+    """Generate NovaCompute class."""
+    charm = app_name = "nova-compute"
+    channel = "ussuri/stable"
+
+    units = {
+        f"nova-compute/{unit_num}": COUUnit(f"nova-compute/{unit_num}", MagicMock(), MagicMock())
+        for unit_num in range(3)
+    }
+    app = NovaCompute(
+        app_name, "", charm, channel, {}, {}, model, "cs", "focal", [], units, "21.0.1"
+    )
+
+    return app
+
+
+def test_nova_compute_upgrade_plan(model):
+    """Testing generating nova-compute upgrade plan."""
+    target = OpenStackRelease("victoria")
+    exp_plan = dedent_plan(
+        """\
+    Upgrade plan for 'nova-compute' to victoria
+        Upgrade software packages of 'nova-compute' from the current APT repositories
+            Upgrade software packages on unit nova-compute/0
+            Upgrade software packages on unit nova-compute/1
+            Upgrade software packages on unit nova-compute/2
+        Refresh 'nova-compute' to the latest revision of 'ussuri/stable'
+        Change charm config of 'nova-compute' 'action-managed-upgrade' to True
+        Upgrade 'nova-compute' to the new channel: 'victoria/stable'
+        Change charm config of 'nova-compute' 'source' to 'cloud:focal-victoria'
+        Upgrade plan for units: nova-compute/0, nova-compute/1, nova-compute/2
+            Upgrade plan for unit: nova-compute/0
+                Disable nova-compute scheduler from unit: 'nova-compute/0'.
+                Check if unit nova-compute/0 has no VMs running before upgrading.
+                ├── Pause the unit: 'nova-compute/0'.
+                ├── Upgrade the unit: 'nova-compute/0'.
+                ├── Resume the unit: 'nova-compute/0'.
+                Enable nova-compute scheduler from unit: 'nova-compute/0'.
+            Upgrade plan for unit: nova-compute/1
+                Disable nova-compute scheduler from unit: 'nova-compute/1'.
+                Check if unit nova-compute/1 has no VMs running before upgrading.
+                ├── Pause the unit: 'nova-compute/1'.
+                ├── Upgrade the unit: 'nova-compute/1'.
+                ├── Resume the unit: 'nova-compute/1'.
+                Enable nova-compute scheduler from unit: 'nova-compute/1'.
+            Upgrade plan for unit: nova-compute/2
+                Disable nova-compute scheduler from unit: 'nova-compute/2'.
+                Check if unit nova-compute/2 has no VMs running before upgrading.
+                ├── Pause the unit: 'nova-compute/2'.
+                ├── Upgrade the unit: 'nova-compute/2'.
+                ├── Resume the unit: 'nova-compute/2'.
+                Enable nova-compute scheduler from unit: 'nova-compute/2'.
+        Wait 1800s for model test_model to reach the idle state.
+        Check if the workload of 'nova-compute' has been upgraded on units: nova-compute/0, nova-compute/1, nova-compute/2
+    """  # noqa: E501 line too long
+    )
+    machines = {f"{i}": generate_cou_machine(f"{i}", f"az-{i}") for i in range(3)}
+    units = {
+        f"nova-compute/{unit}": COUUnit(
+            name=f"nova-compute/{unit}",
+            workload_version="21.0.0",
+            machine=machines[f"{unit}"],
+        )
+        for unit in range(3)
+    }
+    nova_compute = NovaCompute(
+        name="nova-compute",
+        can_upgrade_to="ussuri/stable",
+        charm="nova-compute",
+        channel="ussuri/stable",
+        config={"source": {"value": "distro"}, "action-managed-upgrade": {"value": False}},
+        machines=machines,
+        model=model,
+        origin="ch",
+        series="focal",
+        subordinate_to=[],
+        units=units,
+        workload_version="21.0.0",
+    )
+
+    plan = nova_compute.generate_upgrade_plan(target, False)
+
+    assert str(plan) == exp_plan
+
+
+def test_nova_compute_upgrade_plan_single_unit(model):
+    """Testing generating nova-compute upgrade plan for single unit."""
+    target = OpenStackRelease("victoria")
+    exp_plan = dedent_plan(
+        """\
+    Upgrade plan for 'nova-compute' to victoria
+        Upgrade software packages of 'nova-compute' from the current APT repositories
+            Upgrade software packages on unit nova-compute/0
+        Refresh 'nova-compute' to the latest revision of 'ussuri/stable'
+        Change charm config of 'nova-compute' 'action-managed-upgrade' to True
+        Upgrade 'nova-compute' to the new channel: 'victoria/stable'
+        Change charm config of 'nova-compute' 'source' to 'cloud:focal-victoria'
+        Upgrade plan for units: nova-compute/0
+            Upgrade plan for unit: nova-compute/0
+                Disable nova-compute scheduler from unit: 'nova-compute/0'.
+                Check if unit nova-compute/0 has no VMs running before upgrading.
+                ├── Pause the unit: 'nova-compute/0'.
+                ├── Upgrade the unit: 'nova-compute/0'.
+                ├── Resume the unit: 'nova-compute/0'.
+                Enable nova-compute scheduler from unit: 'nova-compute/0'.
+        Wait 1800s for model test_model to reach the idle state.
+        Check if the workload of 'nova-compute' has been upgraded on units: nova-compute/0
+    """
+    )
+    machines = {f"{i}": generate_cou_machine(f"{i}", f"az-{i}") for i in range(3)}
+    units = {
+        f"nova-compute/{unit}": COUUnit(
+            name=f"nova-compute/{unit}",
+            workload_version="21.0.0",
+            machine=machines[f"{unit}"],
+        )
+        for unit in range(3)
+    }
+    nova_compute = NovaCompute(
+        name="nova-compute",
+        can_upgrade_to="ussuri/stable",
+        charm="nova-compute",
+        channel="ussuri/stable",
+        config={"source": {"value": "distro"}, "action-managed-upgrade": {"value": False}},
+        machines=machines,
+        model=model,
+        origin="ch",
+        series="focal",
+        subordinate_to=[],
+        units=units,
+        workload_version="21.0.0",
+    )
+
+    plan = nova_compute.generate_upgrade_plan(target, False, units=[units["nova-compute/0"]])
+
+    assert str(plan) == exp_plan
+
+
+def test_cinder_upgrade_plan(model):
+    """Testing generating cinder upgrade plan."""
+    target = OpenStackRelease("victoria")
+    exp_plan = dedent_plan(
+        """\
+    Upgrade plan for 'cinder' to victoria
+        Upgrade software packages of 'cinder' from the current APT repositories
+            Upgrade software packages on unit cinder/0
+            Upgrade software packages on unit cinder/1
+            Upgrade software packages on unit cinder/2
+        Refresh 'cinder' to the latest revision of 'ussuri/stable'
+        Upgrade 'cinder' to the new channel: 'victoria/stable'
+        Change charm config of 'cinder' 'openstack-origin' to 'cloud:focal-victoria'
+        Wait 300s for app cinder to reach the idle state.
+        Check if the workload of 'cinder' has been upgraded on units: cinder/0, cinder/1, cinder/2
+    """
+    )
+    machines = {f"{i}": generate_cou_machine(f"{i}", f"az-{i}") for i in range(3)}
+    units = {
+        f"cinder/{i}": COUUnit(
+            name=f"cinder/{i}",
+            workload_version="16.4.2",
+            machine=machines[f"{i}"],
+        )
+        for i in range(3)
+    }
+    cinder = OpenStackApplication(
+        name="cinder",
+        can_upgrade_to="ussuri/stable",
+        charm="cinder",
+        channel="ussuri/stable",
+        config={
+            "openstack-origin": {"value": "distro"},
+            "action-managed-upgrade": {"value": False},
+        },
+        machines=machines,
+        model=model,
+        origin="ch",
+        series="focal",
+        subordinate_to=[],
+        units=units,
+        workload_version="16.4.2",
+    )
+
+    plan = cinder.generate_upgrade_plan(target, False)
+
+    assert str(plan) == exp_plan
+
+
+def test_cinder_upgrade_plan_single_unit(model):
+    """Testing generating cinder upgrade plan."""
+    target = OpenStackRelease("victoria")
+    exp_plan = dedent_plan(
+        """\
+    Upgrade plan for 'cinder' to victoria
+        Upgrade software packages of 'cinder' from the current APT repositories
+            Upgrade software packages on unit cinder/0
+        Refresh 'cinder' to the latest revision of 'ussuri/stable'
+        Change charm config of 'cinder' 'action-managed-upgrade' to True
+        Upgrade 'cinder' to the new channel: 'victoria/stable'
+        Change charm config of 'cinder' 'openstack-origin' to 'cloud:focal-victoria'
+        Upgrade plan for units: cinder/0
+            Upgrade plan for unit: cinder/0
+                Pause the unit: 'cinder/0'.
+                Upgrade the unit: 'cinder/0'.
+                Resume the unit: 'cinder/0'.
+        Wait 300s for app cinder to reach the idle state.
+        Check if the workload of 'cinder' has been upgraded on units: cinder/0
+    """
+    )
+    machines = {f"{i}": generate_cou_machine(f"{i}", f"az-{i}") for i in range(3)}
+    units = {
+        f"cinder/{i}": COUUnit(
+            name=f"cinder/{i}",
+            workload_version="16.4.2",
+            machine=machines[f"{i}"],
+        )
+        for i in range(3)
+    }
+    cinder = OpenStackApplication(
+        name="cinder",
+        can_upgrade_to="ussuri/stable",
+        charm="cinder",
+        channel="ussuri/stable",
+        config={
+            "openstack-origin": {"value": "distro"},
+            "action-managed-upgrade": {"value": False},
+        },
+        machines=machines,
+        model=model,
+        origin="ch",
+        series="focal",
+        subordinate_to=[],
+        units=units,
+        workload_version="16.4.2",
+    )
+
+    plan = cinder.generate_upgrade_plan(target, False, [units["cinder/0"]])
+
+    assert str(plan) == exp_plan

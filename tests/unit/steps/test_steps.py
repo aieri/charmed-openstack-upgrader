@@ -21,26 +21,44 @@ import pytest
 
 from cou.exceptions import CanceledStep
 from cou.steps import (
+    DEPENDENCY_DESCRIPTION_PREFIX,
     BaseStep,
+    HypervisorUpgradePlan,
     PostUpgradeStep,
     PreUpgradeStep,
+    UnitUpgradeStep,
     UpgradePlan,
+    UpgradeStep,
     compare_step_coroutines,
+    is_unit_upgrade_step,
 )
+from cou.utils import app_utils
 
 
-async def mock_coro(*args, **kwargs): ...
+async def _coro(name: str, force: bool = False, units: list | None = None): ...
 
 
 @pytest.mark.parametrize(
     "coro1, coro2, exp_result",
     [
-        (None, mock_coro(), False),
-        (mock_coro(), None, False),
-        (mock_coro(), mock_coro(1, 2, 3), False),
-        (mock_coro(), mock_coro(arg1=True), False),
-        (mock_coro(), mock_coro(), True),
-        (mock_coro(1, 2, 3, kwarg1=True), mock_coro(1, 2, 3, kwarg1=True), True),
+        (None, _coro("test/0"), False),
+        (_coro("test/0"), None, False),
+        (_coro("ceph-mon/1"), _coro("cpeh-mon/1"), False),
+        (_coro("test/0"), _coro(name="test/0"), True),
+        (
+            app_utils.set_require_osd_release_option("ceph-mon/0", MagicMock()),
+            app_utils.set_require_osd_release_option("cpeh-mon/0", MagicMock()),
+            False,
+        ),
+        (_coro("test/0"), _coro(name="test/0", force=False), True),
+        (_coro("test/0", True), _coro(name="test/0", force=False), False),
+        (_coro("test/0", True), _coro(name="test/0", force=True), True),
+        (_coro("test/0", True, ["1", "2", "3"]), _coro(name="test/0", force=True), False),
+        (
+            _coro("test/0", True, ["1", "2", "3"]),
+            _coro("test/0", True, units=["1", "2", "3"]),
+            True,
+        ),
     ],
 )
 def test_compare_step_coroutines(coro1, coro2, exp_result):
@@ -58,7 +76,7 @@ def test_compare_step_coroutines(coro1, coro2, exp_result):
 )
 def test_step_init(description, parallel):
     """Test BaseStep initialization."""
-    coro = mock_coro()
+    coro = _coro("test")
     step = BaseStep(description, parallel, coro)
 
     assert step.description == description
@@ -71,7 +89,7 @@ def test_step_init(description, parallel):
 
 def test_step_hash():
     """Test creation of hash from BaseStep."""
-    coro = mock_coro()
+    coro = _coro("test")
     step = BaseStep("test hash", False, coro)
 
     assert hash(("test hash", False, coro)) == hash(step)
@@ -79,14 +97,14 @@ def test_step_hash():
 
 @pytest.mark.parametrize(
     "description, parallel, args",
-    [("test", False, ()), ("test description", True, ("name", 1, 2))],
+    [("test", False, ("test",)), ("test description", True, ("test", False, ["1", "2", "3"]))],
 )
 def test_step_eq(description, parallel, args):
     """Test BaseStep comparison."""
-    step_1 = BaseStep(description, parallel, mock_coro(*args))
-    step_2 = BaseStep(description, parallel, mock_coro(*args))
+    step_1 = BaseStep(description, parallel, _coro(*args))
+    step_2 = BaseStep(description, parallel, _coro(*args))
     # define step with different coro
-    step_3 = BaseStep(description, parallel, mock_coro(unique_arg=True))
+    step_3 = BaseStep(description, parallel, _coro(name="unique-name"))
 
     assert step_1 == step_2
     assert step_1 != step_3
@@ -113,7 +131,7 @@ def test_step_bool():
     assert bool(plan) is False
 
     # coroutine in the plan sub_steps tree
-    sub_sub_step = BaseStep(description="a.a.a", coro=mock_coro("a.a.a"))
+    sub_sub_step = BaseStep(description="a.a.a", coro=_coro("a.a.a"))
     sub_step.add_step(sub_sub_step)
     plan.add_step(sub_step)
 
@@ -128,10 +146,27 @@ def test_step_str():
     plan = BaseStep(description="a")
     sub_step = BaseStep(description="a.a")
     sub_step.sub_steps = [
-        BaseStep(description="a.a.a", coro=mock_coro("a.a.a")),
-        BaseStep(description="a.a.b", coro=mock_coro("a.a.b")),
+        BaseStep(description="a.a.a", coro=_coro("a.a.a")),
+        BaseStep(description="a.a.b", coro=_coro("a.a.b")),
     ]
-    plan.sub_steps = [sub_step, BaseStep(description="a.b", coro=mock_coro("a.b"))]
+    plan.sub_steps = [sub_step, BaseStep(description="a.b", coro=_coro("a.b"))]
+
+    assert str(plan) == expected
+
+
+def test_step_str_dependent():
+    """Test BaseStep string representation."""
+    expected = (
+        f"a\n\ta.a\n\t\t{DEPENDENCY_DESCRIPTION_PREFIX}a.a.a\n"
+        f"\t\t{DEPENDENCY_DESCRIPTION_PREFIX}a.a.b\n\ta.b\n"
+    )
+    plan = BaseStep(description="a")
+    sub_step = BaseStep(description="a.a")
+    sub_step.sub_steps = [
+        BaseStep(description="a.a.a", coro=_coro("a.a.a"), dependent=True),
+        BaseStep(description="a.a.b", coro=_coro("a.a.b"), dependent=True),
+    ]
+    plan.sub_steps = [sub_step, BaseStep(description="a.b", coro=_coro("a.b"))]
 
     assert str(plan) == expected
 
@@ -155,7 +190,7 @@ def test_step_str_partially_show():
     plan = BaseStep(description="a")
     sub_step = BaseStep(description="a.a")
     sub_step.sub_steps = [
-        BaseStep(description="a.a.a", coro=mock_coro("a.a.a")),
+        BaseStep(description="a.a.a", coro=_coro("a.a.a")),
         BaseStep(description="a.a.b"),
     ]
     # empty BaseStep does not show up
@@ -177,7 +212,7 @@ def test_step_repr():
 def test_step_repr_no_description(step):
     """Test BaseStep representation when there is no description."""
     with pytest.raises(ValueError):
-        step(coro=mock_coro("a"))
+        step(coro=_coro("a"))
 
 
 @pytest.mark.asyncio
@@ -204,7 +239,7 @@ def test_step_add_step():
     exp_sub_steps = 3
     plan = BaseStep(description="plan")
     for i in range(exp_sub_steps):
-        plan.add_step(BaseStep(description=f"sub-step-{i}", coro=mock_coro()))
+        plan.add_step(BaseStep(description=f"sub-step-{i}", coro=_coro("test")))
 
     assert len(plan.sub_steps) == exp_sub_steps
 
@@ -228,15 +263,27 @@ def test_step_add_step_failed():
         plan.add_step(MagicMock())
 
 
+def test_step_add_steps():
+    """Test BaseStep adding sub steps at once."""
+    exp_sub_steps = 3
+    plan = BaseStep(description="plan")
+    plan.add_steps(
+        [BaseStep(description=f"sub-step-{i}", coro=_coro("test")) for i in range(exp_sub_steps)]
+        + [BaseStep(description="empty-step")]  # we also check that empty step will not be added
+    )
+
+    assert len(plan.sub_steps) == exp_sub_steps
+
+
 def test_step_cancel_safe():
     """Test step safe cancel."""
     plan = BaseStep(description="plan")
     plan.sub_steps = sub_steps = [
-        BaseStep(description=f"sub-{i}", coro=mock_coro()) for i in range(10)
+        BaseStep(description=f"sub-{i}", coro=_coro("test")) for i in range(10)
     ]
     # add sub-sub-steps to one sub-step
     sub_steps[0].sub_steps = [
-        BaseStep(description=f"sub-0.{i}", coro=mock_coro()) for i in range(3)
+        BaseStep(description=f"sub-0.{i}", coro=_coro("test")) for i in range(3)
     ]
 
     plan.cancel()
@@ -275,7 +322,7 @@ async def test_step_run_canceled():
     """Test BaseStep run canceled step."""
     description = "test plan"
     exp_error = re.escape(f"Could not run canceled step: BaseStep({description})")
-    step = BaseStep(description=description, coro=mock_coro())
+    step = BaseStep(description=description, coro=_coro("test"))
     step.cancel()
     assert step.canceled is True
     with pytest.raises(CanceledStep, match=exp_error):
@@ -318,7 +365,7 @@ async def test_upgrade_plan_step_invalid_coro_input():
     """Test setting coro for UpgradePlan."""
     description = "test plan"
     with pytest.raises(TypeError):
-        UpgradePlan(description=description, coro=mock_coro())
+        UpgradePlan(description=description, coro=_coro("test"))
 
 
 @pytest.mark.asyncio
@@ -391,3 +438,28 @@ async def test_step_full_run(sub_steps, exp_order, parallel):
         await step_run(plan)
 
     assert steps_order == exp_order
+
+
+@pytest.mark.parametrize(
+    "step, exp_result",
+    [
+        (UnitUpgradeStep(), True),
+        (UpgradeStep(), False),
+        (PreUpgradeStep(), False),
+        (BaseStep(), False),
+    ],
+)
+def test_is_unit_upgrade_step(step, exp_result):
+    """Test helper function for checking if step is unit upgrade step."""
+    assert is_unit_upgrade_step(step) == exp_result
+
+
+@pytest.mark.asyncio
+async def test_hypervisor_upgrade_plan_step_instances():
+    """Test setting parallel for HypervisorUpgradePlan."""
+    description = "test plan"
+    step = HypervisorUpgradePlan(description=description)
+
+    assert step._coro is None
+    assert step.parallel is True
+    assert step.prompt is False

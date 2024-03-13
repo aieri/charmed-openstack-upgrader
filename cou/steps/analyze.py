@@ -79,12 +79,12 @@ class Analysis:
 
         control_plane, data_plane = [], []
         data_plane_machines = {
-            unit.machine for app in apps if is_data_plane(app) for unit in app.units
+            unit.machine for app in apps if is_data_plane(app) for unit in app.units.values()
         }
         for app in apps:
             if is_data_plane(app):
                 data_plane.append(app)
-            elif any(unit.machine in data_plane_machines for unit in app.units):
+            elif any(unit.machine in data_plane_machines for unit in app.units.values()):
                 data_plane.append(app)
             else:
                 control_plane.append(app)
@@ -120,18 +120,8 @@ class Analysis:
         :return: Application objects with their respective information.
         :rtype: List[OpenStackApplication]
         """
-        juju_status = await model.get_status()
-        apps = {
-            AppFactory.create(
-                name=app,
-                status=app_status,
-                config=await model.get_application_config(app),
-                model=model,
-                charm=await model.get_charm_name(app),
-            )
-            for app, app_status in juju_status.applications.items()
-            if app_status
-        }
+        juju_applications = await model.get_applications()
+        apps = {AppFactory.create(app) for app in juju_applications.values()}
 
         # remove non-supported charms that return None on AppFactory.create
         apps.discard(None)
@@ -198,3 +188,38 @@ class Analysis:
             (app.series for app in self.apps_control_plane + self.apps_data_plane),
             default=None,
         )
+
+    @property
+    def data_plane_machines(self) -> dict[str, juju_utils.COUMachine]:
+        """Data-plane machines of the model.
+
+        :return: Data-plane machines of the model.
+        :rtype: dict[str, COUMachine]
+        """
+        return {
+            machine_id: app.machines[machine_id]
+            for app in self.apps_data_plane
+            for machine_id in app.machines
+        }
+
+    @property
+    def control_plane_machines(self) -> dict[str, juju_utils.COUMachine]:
+        """Control-plane machines of the model.
+
+        :return: Control-plane machines of the model.
+        :rtype: dict[str, COUMachine]
+        """
+        return {
+            machine_id: app.machines[machine_id]
+            for app in self.apps_control_plane
+            for machine_id in app.machines
+        }
+
+    @property
+    def machines(self) -> dict[str, juju_utils.COUMachine]:
+        """All machines of the model.
+
+        :return: All machines of the model.
+        :rtype: dict[str, COUMachine]
+        """
+        return {**self.data_plane_machines, **self.control_plane_machines}

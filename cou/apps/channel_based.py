@@ -13,26 +13,26 @@
 # limitations under the License.
 """Channel based application class."""
 import logging
-
-from juju.client._definitions import UnitStatus
+from typing import Iterable, Optional
 
 from cou.apps.base import OpenStackApplication
 from cou.apps.factory import AppFactory
 from cou.steps import PostUpgradeStep
+from cou.utils.juju_utils import COUUnit
 from cou.utils.openstack import CHANNEL_BASED_CHARMS, OpenStackRelease
 
 logger = logging.getLogger(__name__)
 
 
 @AppFactory.register_application(CHANNEL_BASED_CHARMS)
-class OpenStackChannelBasedApplication(OpenStackApplication):
+class ChannelBasedApplication(OpenStackApplication):
     """Application for charms that are channel based."""
 
-    def _get_latest_os_version(self, unit: UnitStatus) -> OpenStackRelease:
+    def _get_latest_os_version(self, unit: COUUnit) -> OpenStackRelease:
         """Get the latest compatible OpenStack release based on the channel.
 
-        :param unit: Application Unit
-        :type unit: UnitStatus
+        :param unit: COUUnit
+        :type unit: COUUnit
         :raises ApplicationError: When there are no compatible OpenStack release for the
         workload version.
         :return: The latest compatible OpenStack release.
@@ -58,9 +58,11 @@ class OpenStackChannelBasedApplication(OpenStackApplication):
         :return: True if is versionless, False otherwise.
         :rtype: bool
         """
-        return not all(unit.workload_version for unit in self.status.units.values())
+        return not all(unit.workload_version for unit in self.units.values())
 
-    def post_upgrade_steps(self, target: OpenStackRelease) -> list[PostUpgradeStep]:
+    def post_upgrade_steps(
+        self, target: OpenStackRelease, units: Optional[Iterable[COUUnit]]
+    ) -> list[PostUpgradeStep]:
         """Post Upgrade steps planning.
 
         Wait until the application reaches the idle state and then check the target workload.
@@ -68,9 +70,11 @@ class OpenStackChannelBasedApplication(OpenStackApplication):
 
         :param target: OpenStack release as target to upgrade.
         :type target: OpenStackRelease
+        :param units: Units to generate post upgrade plan
+        :type units: Optional[Iterable[COUUnit]]
         :return: List of post upgrade steps.
         :rtype: list[PostUpgradeStep]
         """
         if self.is_versionless:
             return []
-        return super().post_upgrade_steps(target)
+        return super().post_upgrade_steps(target, units)
